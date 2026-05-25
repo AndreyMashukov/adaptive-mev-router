@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  HUFF_RELEASE: nightly
+  HUFF_ASSET: huff_nightly_linux_amd64.tar.gz
+
 jobs:
   unit:
     name: Unit tests + Yul/Huff parity
@@ -18,18 +22,26 @@ jobs:
           cache: 'npm'
 
       - name: Install huffc
-        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/huff.tar.gz \
+            "https://github.com/huff-language/huff-rs/releases/download/${HUFF_RELEASE}/${HUFF_ASSET}"
+          mkdir -p /tmp/huff
+          tar -xzf /tmp/huff.tar.gz -C /tmp/huff
+          sudo find /tmp/huff -type f -name huffc -exec mv {} /usr/local/bin/huffc \;
+          sudo chmod +x /usr/local/bin/huffc
+          huffc --version
 
       - name: Install deps
-        run: npm install
+        run: npm ci
 
       - name: Compile (Solidity + Yul)
         run: npx hardhat compile
 
-      - name: Compile MEV_V2.huff
+      - name: Compile MEV_V2.huff (runtime bytecode)
         run: |
           mkdir -p artifacts
-          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          huffc contracts/MEV_V2.huff -r > artifacts/MEV_V2_huff.bin
 
       - name: Run unit tests (Yul + Huff variants)
         run: npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js
@@ -47,22 +59,42 @@ jobs:
           cache: 'npm'
 
       - name: Install huffc
-        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/huff.tar.gz \
+            "https://github.com/huff-language/huff-rs/releases/download/${HUFF_RELEASE}/${HUFF_ASSET}"
+          mkdir -p /tmp/huff
+          tar -xzf /tmp/huff.tar.gz -C /tmp/huff
+          sudo find /tmp/huff -type f -name huffc -exec mv {} /usr/local/bin/huffc \;
+          sudo chmod +x /usr/local/bin/huffc
+          huffc --version
 
       - name: Install deps
-        run: npm install
+        run: npm ci
 
       - name: Compile
         run: |
           npx hardhat compile
           mkdir -p artifacts
-          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          huffc contracts/MEV_V2.huff -r > artifacts/MEV_V2_huff.bin
 
       - name: Run fork tests
         env:
           HARDHAT_FORK: '1'
           MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL || 'https://ethereum-rpc.publicnode.com' }}
         run: npx hardhat test test/GreedySimulatorV2.fork.test.js test/MEV_V2_v4_nested.fork.test.js
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t adaptive-mev-router:ci .
+
+      - name: Run unit suite inside image
+        run: docker run --rm adaptive-mev-router:ci
 
   gas-report:
     name: Gas diff report
@@ -80,13 +112,20 @@ jobs:
           cache: 'npm'
 
       - name: Install huffc
-        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/huff.tar.gz \
+            "https://github.com/huff-language/huff-rs/releases/download/${HUFF_RELEASE}/${HUFF_ASSET}"
+          mkdir -p /tmp/huff
+          tar -xzf /tmp/huff.tar.gz -C /tmp/huff
+          sudo find /tmp/huff -type f -name huffc -exec mv {} /usr/local/bin/huffc \;
+          sudo chmod +x /usr/local/bin/huffc
 
       - name: Baseline gas (base branch)
         run: |
-          npm install
+          npm ci
           npx hardhat compile
-          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          huffc contracts/MEV_V2.huff -r > artifacts/MEV_V2_huff.bin
           REPORT_GAS=true GAS_REPORT_FILE=gas-base.txt npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js || true
 
       - uses: actions/checkout@v4
@@ -95,9 +134,9 @@ jobs:
 
       - name: PR gas
         run: |
-          npm install
+          npm ci
           npx hardhat compile
-          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          huffc contracts/MEV_V2.huff -r > artifacts/MEV_V2_huff.bin
           REPORT_GAS=true GAS_REPORT_FILE=gas-pr.txt npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js || true
 
       - name: Diff comment

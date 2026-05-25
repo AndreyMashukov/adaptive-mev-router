@@ -309,17 +309,34 @@ The script prints three blocks — paste them into `MEV_V2.huff`, `MEV_V2.yul`, 
 
 ## Install / Build
 
+### Docker (reproducible, recommended)
+
+```bash
+docker build -t adaptive-mev-router .
+docker run --rm adaptive-mev-router            # runs unit suite (Yul + Huff foreach)
+```
+
+The image bundles Node 22, hardhat, and `huffc` (pinned to the `nightly` huff-rs release that publishes Linux binaries — the tagged 0.3.2 has none). Same flow CI uses.
+
+### Native
+
 ```bash
 git clone https://github.com/AndreyMashukov/adaptive-mev-router.git
 cd adaptive-mev-router
-npm install
+npm ci
 
 # Solidity + Yul:
 npx hardhat compile
 
-# Huff (separate toolchain — installs `huffc` into ~/.huff/bin):
-curl -L get.huff.sh | bash
-huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+# huffc — install once (Linux amd64; for macOS use the matching huff_nightly_darwin_* asset):
+curl -fsSL -o /tmp/huff.tar.gz \
+  https://github.com/huff-language/huff-rs/releases/download/nightly/huff_nightly_linux_amd64.tar.gz
+mkdir -p /tmp/huff && tar -xzf /tmp/huff.tar.gz -C /tmp/huff
+sudo mv $(find /tmp/huff -name huffc -type f) /usr/local/bin/huffc
+
+# Build huff runtime bytecode (required — tests hard-fail without it):
+mkdir -p artifacts
+huffc contracts/MEV_V2.huff -r > artifacts/MEV_V2_huff.bin
 ```
 
 ## Usage
