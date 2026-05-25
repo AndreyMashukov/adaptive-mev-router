@@ -2,7 +2,10 @@ require("@nomicfoundation/hardhat-toolbox");
 require("@tovarishfin/hardhat-yul");
 
 const MAINNET_RPC_URL = process.env.MAINNET_RPC_URL || "https://ethereum-rpc.publicnode.com";
-const FORK_BLOCK = process.env.FORK_BLOCK ? Number(process.env.FORK_BLOCK) : 24596300;
+// FORK_BLOCK is opt-in: fork at HEAD by default so a non-archive public RPC works.
+// Pool reserves and balances are overridden in tests via hardhat_setStorageAt, so the
+// specific block doesn't matter — pin one only when you need byte-for-byte replay.
+const FORK_BLOCK = process.env.FORK_BLOCK ? Number(process.env.FORK_BLOCK) : undefined;
 
 module.exports = {
   solidity: {
@@ -22,7 +25,7 @@ module.exports = {
       hardfork: "cancun",
       forking: process.env.HARDHAT_FORK ? {
         url: MAINNET_RPC_URL,
-        blockNumber: FORK_BLOCK,
+        ...(FORK_BLOCK !== undefined ? { blockNumber: FORK_BLOCK } : {}),
       } : undefined,
     },
   },

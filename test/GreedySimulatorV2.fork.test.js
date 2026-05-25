@@ -240,9 +240,10 @@ describe("GreedySimulatorV2 — Fork Tests", function () {
 
   // ========== MEV contract execution: greedy → allocations → simulateFlash per route ==========
 
-  // PLACEHOLDER — replace with your operator address.
+  // PLACEHOLDER — operator addr and slot must match (slot N → OP_HASH_N keyed off addr).
+  // Slot 0 is wired in MEV_V2.huff/.yul to keccak256(0x...01); change both together for real ops.
   const OPERATOR = "0x0000000000000000000000000000000000000001";
-  const OPERATOR_INDEX = 10;
+  const OPERATOR_INDEX = 0;
 
   const mevContracts = [
     { name: "MEV_V2.yul",  bytecode: () => require("../artifacts/contracts/MEV_V2.yul/MEV_V2.json").bytecode, runtime: false },
