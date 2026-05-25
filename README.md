@@ -365,7 +365,7 @@ See `test/MEV_V2.test.js` for ~100 worked examples.
 
 | Repo | Role |
 |------|------|
-| [`amashukov/reth-mev`](https://github.com/AndreyMashukov/reth-mev) *(forthcoming)* | Custom Reth node with extended RPC for batched reserves, state-override simulation, mempool stream |
+| [`amashukov/reth-mev`](https://github.com/AndreyMashukov/reth-mev) [![reth-mev CI](https://img.shields.io/github/actions/workflow/status/AndreyMashukov/reth-mev/ci.yml?branch=main&label=CI)](https://github.com/AndreyMashukov/reth-mev/actions) | Custom Reth node (v1.11.1) with extended `mev_` RPC: flash arbitrage / sandwich / backrun search executed in-process against live MDBX state via revm |
 | [`amashukov/eth-rpc-client-php`](https://github.com/AndreyMashukov/eth-rpc-client-php) | ethers.js-style typed JSON-RPC client (PHP), useful for off-chain bot scaffolding from non-Rust stacks |
 
 ## Quality
