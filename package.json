@@ -1,0 +1,52 @@
+{
+  "name": "adaptive-mev-router",
+  "version": "0.1.0",
+  "description": "Adaptive MEV execution framework — Yul + Huff opcode dispatcher with on-chain amountOut compute, balanceOf fallback, multi-DEX (V2/V3/V4/Balancer/Curve/Fluid/Dodo).",
+  "homepage": "https://github.com/AndreyMashukov/adaptive-mev-router",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AndreyMashukov/adaptive-mev-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AndreyMashukov/adaptive-mev-router/issues"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Andrei Mashukov",
+    "email": "a.mashukoff@gmail.com"
+  },
+  "keywords": [
+    "mev",
+    "ethereum",
+    "evm",
+    "arbitrage",
+    "huff",
+    "yul",
+    "uniswap-v2",
+    "uniswap-v3",
+    "uniswap-v4",
+    "balancer",
+    "curve",
+    "flashbots",
+    "solidity",
+    "hardhat"
+  ],
+  "scripts": {
+    "build": "hardhat compile",
+    "test": "hardhat test",
+    "test:unit": "hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js",
+    "test:fork": "hardhat test test/GreedySimulatorV2.fork.test.js test/MEV_V2_v4_nested.fork.test.js",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "op-hashes": "node scripts/compute_op_hashes.js"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
+    "@nomicfoundation/hardhat-ethers": "^3.1.3",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@tovarishfin/hardhat-yul": "^3.0.5",
+    "chai": "^4.5.0",
+    "ethers": "^6.14.3",
+    "hardhat": "^2.22.17",
+    "hardhat-gas-reporter": "^1.0.10"
+  }
+}

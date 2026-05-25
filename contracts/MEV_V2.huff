@@ -1,0 +1,1533 @@
+// SPDX-License-Identifier: UNLICENSED
+// MEV_V2.huff — Huff port of MEV_V2.yul with O(1) jump table dispatch
+// Changes from V1: adaptive amounts (balanceOf fallback), on-chain V2 amountOut compute,
+// sweep command (0x0E), no V3 flash loan (0x0E/0x0F removed)
+
+// ============================================================
+// Constants
+// ============================================================
+#define constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+// Multi-operator auth: expected = keccak256(abi.encode(operatorAddress)) for each slot.
+// Slots 0-9: EOA operators, slot 10: Vault contract.
+// PLACEHOLDER VALUES — derived from addresses 0x0...01 .. 0x0...0B.
+// Regenerate via `node scripts/compute_op_hashes.js 0xYourOp0 0xYourOp1 ...` before any production deploy.
+#define constant OP_HASH_0  = 0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6
+#define constant OP_HASH_1  = 0x405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace
+#define constant OP_HASH_2  = 0xc2575a0e9e593c00f959f8c92f12db2869c3395a3b0502d05e2516446f71f85b
+#define constant OP_HASH_3  = 0x8a35acfbc15ff81a39ae7d344fd709f28e8600b4aa8c65c6b64bfe7fe36bd19b
+#define constant OP_HASH_4  = 0x036b6384b5eca791c62761152d0c79bb0604c104a5fb6f4eb0703f3154bb3db0
+#define constant OP_HASH_5  = 0xf652222313e28459528d920b65115c16c04f3efc82aaedc97be59f3f377c0d3f
+#define constant OP_HASH_6  = 0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c688
+#define constant OP_HASH_7  = 0xf3f7a9fe364faab93b216da50a3214154f22a0a2b415b23a84c8169e8b636ee3
+#define constant OP_HASH_8  = 0x6e1540171b6c0c960b71a7020d9f60077f6af931a8bbf590da0223dacf75c7af
+#define constant OP_HASH_9  = 0xc65a7bb8d6351c1cf70c95a316cc6a92839c986682d98bc35f958f4883f9d2a8
+#define constant OP_HASH_10 = 0x0175b7a638427703f0dbe7bb9bbf987a2551717b34e79f33b5b1008d1fa01db9
+#define constant MIN_SQRT_RATIO_PLUS_1 = 0x01000276A4
+#define constant MAX_SQRT_RATIO_MINUS_1 = 0xFFFD8963EFD1FC6A506488495D951D5263988D25
+
+// ============================================================
+// Multi-operator auth macros
+// ============================================================
+
+/// CHECK_OPERATOR: verify origin() hash matches one of 11 operators (0-9: EOA, 10: Vault)
+/// Index from 4 low bits of priority fee: (gasprice - basefee) & 0xF
+#define macro CHECK_OPERATOR() = takes(0) returns(0) {
+    basefee gasprice sub 0xF and   // [idx]
+
+    dup1 0x00 eq hash0 jumpi
+    dup1 0x01 eq hash1 jumpi
+    dup1 0x02 eq hash2 jumpi
+    dup1 0x03 eq hash3 jumpi
+    dup1 0x04 eq hash4 jumpi
+    dup1 0x05 eq hash5 jumpi
+    dup1 0x06 eq hash6 jumpi
+    dup1 0x07 eq hash7 jumpi
+    dup1 0x08 eq hash8 jumpi
+    dup1 0x09 eq hash9 jumpi
+    dup1 0x0A eq hash10 jumpi
+    err jump                       // index 11-15 = invalid
+
+    hash0: pop [OP_HASH_0] check jump
+    hash1: pop [OP_HASH_1] check jump
+    hash2: pop [OP_HASH_2] check jump
+    hash3: pop [OP_HASH_3] check jump
+    hash4: pop [OP_HASH_4] check jump
+    hash5: pop [OP_HASH_5] check jump
+    hash6: pop [OP_HASH_6] check jump
+    hash7: pop [OP_HASH_7] check jump
+    hash8: pop [OP_HASH_8] check jump
+    hash9: pop [OP_HASH_9] check jump
+    hash10: pop [OP_HASH_10] check jump
+
+    check:                         // [expected_hash]
+        origin 0x00 mstore
+        0x20 0x00 sha3             // [actual_hash, expected_hash]
+        eq iszero err jumpi        // revert if mismatch
+}
+
+
+// ============================================================
+// Jump Table — 31 entries, packed (2 bytes each)
+// 0x00-0x0E = fixed commands, 0x0F = placeholder, 0x10-0x1E = flash + DEX
+// ============================================================
+#define jumptable__packed COMMAND_TABLE {
+    cmd_v2_swap_zfo         // 0x00
+    cmd_v2_swap_ofz         // 0x01
+    cmd_v3_swap_zfo         // 0x02
+    cmd_v3_swap_ofz         // 0x03
+    cmd_bal_swap_zfo        // 0x04
+    cmd_bal_swap_ofz        // 0x05
+    cmd_curve_zfo           // 0x06
+    cmd_curve_ofz           // 0x07
+    cmd_wrap_weth           // 0x08
+    cmd_bribe               // 0x09
+    cmd_unwrap_weth         // 0x0A
+    cmd_transfer_eth        // 0x0B
+    cmd_transfer_erc20      // 0x0C
+    cmd_balance_check       // 0x0D
+    cmd_sweep               // 0x0E (was v3_flash_z in V1)
+    cmd_invalid             // 0x0F (unused, placeholder)
+    cmd_v2_flash_z          // 0x10
+    cmd_v2_flash_o          // 0x11
+    cmd_v3_flash_swap_z     // 0x12
+    cmd_v3_flash_swap_o     // 0x13
+    cmd_v4_unlock           // 0x14
+    cmd_v4_swap_zfo         // 0x15
+    cmd_v4_swap_ofz         // 0x16
+    cmd_v4_settle           // 0x17
+    cmd_v4_take             // 0x18
+    cmd_bal_v1_zfo          // 0x19
+    cmd_bal_v1_ofz          // 0x1A
+    cmd_fluid_zfo           // 0x1B
+    cmd_fluid_ofz           // 0x1C
+    cmd_dodo_zfo            // 0x1D
+    cmd_dodo_ofz            // 0x1E
+}
+
+// ============================================================
+// Helper Macros
+// ============================================================
+
+/// @notice transfer(address,uint256)
+#define macro TRANSFER_TOKEN() = takes(3) returns(0) {
+    // stack: [account, amount, token]
+    // mstore account at 4, amount at 36; token stays for call target
+    0xa9059cbb00000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x04 mstore          // stack: [amount, token]
+    0x24 mstore          // stack: [token]
+    // call(gas, token, 0, 0, 68, 0, 32)
+    0x00 0x44 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice approve(address,uint256) — single approve
+#define macro APPROVE_TOKEN() = takes(3) returns(0) {
+    // stack: [spender, amount, token]
+    0x095ea7b300000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x04 mstore          // stack: [amount, token]
+    0x24 mstore          // stack: [token]
+    // call(gas, token, 0, 0, 68, 0, 32)
+    0x00 0x44 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice safeApprove: approve(spender, 0) then approve(spender, amount)
+/// Required for USDT which reverts if current allowance != 0
+#define macro SAFE_APPROVE_TOKEN() = takes(3) returns(0) {
+    // stack: [spender, amount, token]
+    // Step 1: approve(spender, 0) — reset allowance
+    0x095ea7b300000000000000000000000000000000000000000000000000000000 0x00 mstore
+    dup1          // dup spender (pos 1)
+    0x04 mstore   // mem[4] = spender, stack: [spender, amount, token]
+    0x00 0x24 mstore   // mem[36] = 0, stack: [spender, amount, token]
+    // call(gas, token, 0, 0, 68, 0, 0)
+    0x00 0x00 0x44 0x00 0x00
+    // stack: [0, 0, 0x44, 0, 0, spender, amount, token]
+    //  pos:   1  2   3    4  5    6       7      8
+    dup8          // token (pos 8)
+    gas call
+    pop           // ignore result, stack: [spender, amount, token]
+
+    // Step 2: approve(spender, amount) — set real allowance
+    0x095ea7b300000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x04 mstore   // mem[4] = spender, stack: [amount, token]
+    0x24 mstore   // mem[36] = amount, stack: [token]
+    0x00 0x44 0x00 0x00 0x00 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice balanceOf(address) -> uint256
+/// stack: [account, token] — account is on TOP, token below
+/// account is written to mem[4], token is staticcall target
+#define macro BALANCE_OF() = takes(2) returns(1) {
+    // stack: [account, token]
+    0x70a0823100000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x04 mstore          // mem[4] = account (pops account). stack: [token]
+    // staticcall(gas, token, 0, 36, 0, 32)
+    0x00 0x24 0x00 0x20 swap4
+    gas staticcall
+    iszero err jumpi
+    0x00 mload           // stack: [balance]
+}
+
+/// @notice WETH.deposit{value: amount}()
+#define macro DEPOSIT_WETH() = takes(1) returns(0) {
+    // stack: [amount]
+    0xd0e30db000000000000000000000000000000000000000000000000000000000 0x00 mstore
+    // call(gas, WETH, amount, 0, 4, 0, 0)
+    0x00 0x04 0x00 0x00 swap4 [WETH]
+    gas call
+    iszero err jumpi
+}
+
+/// @notice WETH.withdraw(uint256)
+#define macro WITHDRAW_WETH() = takes(1) returns(0) {
+    // stack: [amount]
+    0x2e1a7d4d00000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x04 mstore
+    // call(gas, WETH, 0, 0, 36, 0, 0)
+    0x00 0x00 0x24 0x00 0x00 [WETH]
+    gas call
+    iszero err jumpi
+}
+
+// ============================================================
+// Swap Macros (same as V1)
+// ============================================================
+
+/// @notice Uniswap V2 swap(uint256,uint256,address,bytes)
+#define macro SWAP_V2() = takes(5) returns(0) {
+    // stack: [sig, pair, amount0, amount1, to]
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]
+    // stack: [pair, amount0, amount1, to]
+    swap1 0x04 mstore     // stack: [pair, amount1, to]
+    swap1 0x24 mstore     // stack: [pair, to]
+    swap1 0x44 mstore     // stack: [pair]
+    0x80 0x64 mstore      // data offset = 128 = 0x80 (132-4)
+    0x00 0x84 mstore      // data length = 0
+    // call(gas, pair, 0, 0, 164, 0, 0)
+    0x00 0xa4 0x00 0x00 0x00 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice Uniswap V3 swap(address,bool,int256,uint160,bytes)
+/// stack: [sig, pool, account, zeroForOne, amount, priceLimit, token0, token1, amountIn]
+#define macro SWAP_V3() = takes(9) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]
+    // stack: [pool, account, zfo, amount, priceLimit, token0, token1, amountIn]
+    // account at 4
+    swap6                 // stack: [token1, account, zfo, amount, priceLimit, token0, pool, amountIn]
+    swap1 0x04 mstore     // stack: [token1, zfo, amount, priceLimit, token0, pool, amountIn]
+    // zeroForOne at 36
+    swap5                 // stack: [pool, zfo, amount, priceLimit, token0, token1, amountIn]
+    swap1 0x24 mstore     // stack: [pool, amount, priceLimit, token0, token1, amountIn]
+    // amount at 68
+    swap1 0x44 mstore     // stack: [pool, priceLimit, token0, token1, amountIn]
+    // priceLimit at 100
+    swap1 0x64 mstore     // stack: [pool, token0, token1, amountIn]
+    // bytes offset at 132
+    0xa0 0x84 mstore      // 160 = 0xa0 (164-4)
+    // bytes length at 164 = 56
+    0x38 0xa4 mstore
+    // token0 (20 bytes) at 196
+    swap1                 // stack: [token0, pool, token1, amountIn]
+    0x60 shl 0xc4 mstore  // stack: [pool, token1, amountIn]
+    // token1 (20 bytes) at 216
+    swap1                 // stack: [token1, pool, amountIn]
+    0x60 shl 0xd8 mstore  // stack: [pool, amountIn]
+    // zeroForOne (1 byte) at 236 — read it back from mem[0x24]
+    0x24 mload 0xf8 shl 0xec mstore  // stack: [pool, amountIn]
+    // amountIn (14 bytes) at 237
+    swap1                 // stack: [amountIn, pool]
+    0x90 shl 0xed mstore  // stack: [pool]
+    // call(gas, pool, 0, 0, 252, 0, 64)
+    0x00 0xfc 0x00 0x00 0x40 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice Balancer V2 vault.swap()
+/// stack: [sig, poolId, assetIn, assetOut, amountIn, vault]
+#define macro SWAP_V2_BALANCER() = takes(6) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]
+    // stack: [poolId, assetIn, assetOut, amountIn, vault]
+    // Offset to SingleSwap struct at 4
+    0xe0 0x04 mstore      // 224 = 0xE0
+    // FundManagement
+    address 0x24 mstore   // sender
+    0x00 0x44 mstore      // fromInternalBalance
+    address 0x64 mstore   // recipient
+    0x00 0x84 mstore      // toInternalBalance
+    // limit
+    0x00 0xa4 mstore
+    // deadline
+    timestamp 0xc4 mstore
+    // SingleSwap struct at offset 228 (0xe4)
+    // stack: [poolId, assetIn, assetOut, amountIn, vault]
+    0xe4 mstore           // poolId at 0xe4, stack: [assetIn, assetOut, amountIn, vault]
+    // SwapKind.GIVEN_IN = 0
+    0x00 0x0104 mstore
+    0x0124 mstore         // assetIn at 0x0124, stack: [assetOut, amountIn, vault]
+    0x0144 mstore         // assetOut at 0x0144, stack: [amountIn, vault]
+    0x0164 mstore         // amountIn at 0x0164, stack: [vault]
+    // userData offset + length
+    0xc0 0x0184 mstore    // userData offset = 192
+    0x00 0x01a4 mstore    // userData length = 0
+    // call(gas, vault, 0, 0, 452, 0, 32)
+    0x00 0x01c4 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice Curve exchange(int128/uint256, int128/uint256, uint256, uint256)
+/// stack: [sig, pool, sellId, buyId, amount]
+#define macro SWAP_CURVE_EXEC() = takes(5) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]. stack: [pool, sellId, buyId, amount]
+    swap1 0x04 mstore     // sellId at mem[4]. stack: [pool, buyId, amount]
+    swap1 0x24 mstore     // buyId at mem[36]. stack: [pool, amount]
+    swap1 0x44 mstore     // amount at mem[68]. stack: [pool]
+    0x00 0x64 mstore      // minOut = 0
+    // call(gas, pool, 0, 0, 132, 0, 32)
+    0x00 0x84 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice Curve exchange with native ETH (value = amount)
+/// stack: [sig, pool, sellId, buyId, amount]
+#define macro SWAP_CURVE_ETH_EXEC() = takes(5) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]. stack: [pool, sellId, buyId, amount]
+    swap1 0x04 mstore     // sellId at mem[4]. stack: [pool, buyId, amount]
+    swap1 0x24 mstore     // buyId at mem[36]. stack: [pool, amount]
+    dup2 0x44 mstore      // amount at mem[68], keep both on stack. stack: [pool, amount]
+    0x00 0x64 mstore      // minOut = 0. stack: [pool, amount]
+    // call(gas, pool, amount, 0, 132, 0, 32) — amount as msg.value
+    0x20 0x00 0x84 0x00   // stack: [0x00, 0x84, 0x00, 0x20, pool, amount]
+    dup6 dup6             // stack: [pool, amount, 0x00, 0x84, 0x00, 0x20, pool, amount]
+    gas call
+    iszero err jumpi
+    pop pop               // clean up leftover pool and amount from dup6 dup6
+}
+
+/// @notice Balancer V1 swapExactAmountIn(tokenIn, tokenAmountIn, tokenOut, minAmountOut, maxPrice)
+/// stack: [sig, pool, tokenIn, amount, tokenOut]
+#define macro SWAP_BAL_V1_EXEC() = takes(5) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]. stack: [pool, tokenIn, amount, tokenOut]
+    swap1 0x04 mstore     // tokenIn at mem[4]. stack: [pool, amount, tokenOut]
+    swap1 0x24 mstore     // amount at mem[36]. stack: [pool, tokenOut]
+    swap1 0x44 mstore     // tokenOut at mem[68]. stack: [pool]
+    0x00 0x64 mstore      // minAmountOut = 0
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF 0x84 mstore  // maxPrice = MAX_UINT
+    // call(gas, pool, 0, 0, 164, 0, 64)
+    0x00 0xa4 0x00 0x00 0x40 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice Fluid DEX swap(bool swap0to1, uint256 amountIn, uint256 amountOut, address to)
+/// stack: [sig, pool, zfo, amount]
+#define macro SWAP_FLUID_EXEC() = takes(4) returns(0) {
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]. stack: [pool, zfo, amount]
+    swap1 0x04 mstore     // zfo at mem[4]. stack: [pool, amount]
+    swap1 0x24 mstore     // amount at mem[36]. stack: [pool]
+    0x00 0x44 mstore      // amountOut (min) = 0
+    address 0x64 mstore   // to = self
+    // call(gas, pool, 0, 0, 132, 0, 32)
+    0x00 0x84 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice DODO V2 sellBase(address to) / sellQuote(address to)
+/// stack: [sig, pool]
+#define macro SWAP_DODO_EXEC() = takes(2) returns(0) {
+    // stack: [sig, pool]
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]. stack: [pool]
+    address 0x04 mstore   // to = self
+    // call(gas, pool, 0, 0, 36, 0, 32)
+    0x00 0x24 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+/// @notice V4 swap via PoolManager
+/// stack: [pm, currency0, currency1, fee, tickSpacing, hooks, zeroForOne, amount]
+#define macro V4_SWAP_EXEC() = takes(8) returns(0) {
+    0xf3cd914c00000000000000000000000000000000000000000000000000000000 0x00 mstore
+    // currency0 at 4
+    swap6                 // stack: [zeroForOne, currency0, currency1, fee, tickSpacing, hooks, pm, amount]
+    swap1 0x04 mstore     // stack: [zeroForOne, currency1, fee, tickSpacing, hooks, pm, amount]
+    // currency1 at 36
+    swap1 0x24 mstore     // stack: [zeroForOne, fee, tickSpacing, hooks, pm, amount]
+    // fee at 68
+    swap1 0x44 mstore     // stack: [zeroForOne, tickSpacing, hooks, pm, amount]
+    // tickSpacing at 100
+    swap1 0x64 mstore     // stack: [zeroForOne, hooks, pm, amount]
+    // hooks at 132
+    swap1 0x84 mstore     // stack: [zeroForOne, pm, amount]
+    // zeroForOne at 164
+    dup1 0xa4 mstore      // stack: [zeroForOne, pm, amount]
+    // amount at 196 — negate it: sub(0, amount)
+    swap2                 // stack: [amount, pm, zeroForOne]
+    0x00 sub 0xc4 mstore  // stack: [pm, zeroForOne]
+    // sqrtPriceLimitX96 at 228 — depends on zeroForOne
+    swap1                 // stack: [zeroForOne, pm]
+    dup1 iszero v4_swap_ofz_limit jumpi
+    // zfo: MIN_SQRT_RATIO + 1
+    0x01000276A4 0xe4 mstore
+    v4_swap_after_limit jump
+    v4_swap_ofz_limit:
+    // ofz: MAX_SQRT_RATIO - 1
+    0xFFFD8963EFD1FC6A506488495D951D5263988D25 0xe4 mstore
+    v4_swap_after_limit:
+    pop                   // drop zeroForOne, stack: [pm]
+    // hookData offset at 260
+    0x0120 0x0104 mstore  // 288 = 0x120
+    // hookData length at 292
+    0x00 0x0124 mstore
+    // call(gas, pm, 0, 0, 324, 0, 32)
+    0x00 0x0144 0x00 0x00 0x20 swap5
+    gas call
+    iszero err jumpi
+}
+
+// ============================================================
+// Flash Macros (unchanged from V1)
+// ============================================================
+
+/// @notice V2 swap(uint256,uint256,address,bytes) for flash
+/// stack: [sig, pair, amount0, amount1, cmdOffset, cmdLen]
+#define macro FLASH_V2_DEEP() = takes(6) returns(0) {
+    // selector from stack
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]
+    // stack: [pair, amount0, amount1, cmdOffset, cmdLen]
+    swap4              // [cmdLen, amount0, amount1, cmdOffset, pair]
+    swap3              // [cmdOffset, amount0, amount1, cmdLen, pair]
+    swap1              // [amount0, cmdOffset, amount1, cmdLen, pair]
+    0x04 mstore        // amount0Out at 4. [cmdOffset, amount1, cmdLen, pair]
+    swap1              // [amount1, cmdOffset, cmdLen, pair]
+    0x24 mstore        // amount1Out at 36. [cmdOffset, cmdLen, pair]
+    address 0x44 mstore // to = address() at 68
+    0x80 0x64 mstore   // data offset = 128 at 100
+    swap1              // [cmdLen, cmdOffset, pair]
+    dup1 0x84 mstore   // cmdLen at 132. [cmdLen, cmdOffset, pair]
+    dup1 0xa4 add      // [argsLen, cmdLen, cmdOffset, pair]
+    swap2              // [cmdOffset, cmdLen, argsLen, pair]
+    0xa4 swap1         // [cmdOffset, 0xa4, cmdLen, argsLen, pair]
+    swap1              // [0xa4, cmdOffset, cmdLen, argsLen, pair]
+    calldatacopy       // [argsLen, pair]
+    // call(gas, pair, 0, 0, argsLen, 0, 0)
+    swap1              // [pair, argsLen]
+    0x00 swap2         // [argsLen, pair, 0]
+    0x00 swap2         // [pair, argsLen, 0, 0]
+    0x00 swap1         // [pair, 0, argsLen, 0, 0]
+    0x00 swap1         // [pair, 0, 0, argsLen, 0, 0]
+    gas call
+    iszero err jumpi
+}
+
+/// @notice V3 swap for flash swap
+/// stack: [sig, pool, zeroForOne, amount, priceLimit, cmdOffset, cmdLen]
+#define macro FLASH_SWAP_V3_DEEP() = takes(7) returns(0) {
+    // selector from stack
+    0xe0 shl 0x00 mstore  // sig<<224 at mem[0]
+    address 0x04 mstore
+    // Rearrange: move pool aside
+    // stack: [pool, zeroForOne, amount, priceLimit, cmdOffset, cmdLen]
+    swap5              // [cmdLen, zeroForOne, amount, priceLimit, cmdOffset, pool]
+    swap4              // [cmdOffset, zeroForOne, amount, priceLimit, cmdLen, pool]
+    swap1              // [zeroForOne, cmdOffset, amount, priceLimit, cmdLen, pool]
+    0x24 mstore        // zeroForOne at 36. [cmdOffset, amount, priceLimit, cmdLen, pool]
+    swap1              // [amount, cmdOffset, priceLimit, cmdLen, pool]
+    0x00 sub           // negate: exactOutput needs negative amountSpecified
+    0x44 mstore        // -amount at 68. [cmdOffset, priceLimit, cmdLen, pool]
+    swap1              // [priceLimit, cmdOffset, cmdLen, pool]
+    0x64 mstore        // priceLimit at 100. [cmdOffset, cmdLen, pool]
+    0xa0 0x84 mstore   // data offset = 160 at 132
+    swap1              // [cmdLen, cmdOffset, pool]
+    dup1 0xa4 mstore   // cmdLen at 164. [cmdLen, cmdOffset, pool]
+    dup1 0xc4 add      // [argsLen, cmdLen, cmdOffset, pool]
+    // calldatacopy(196, cmdOffset, cmdLen)
+    swap2              // [cmdOffset, cmdLen, argsLen, pool]
+    0xc4 swap1         // [cmdOffset, 0xc4, cmdLen, argsLen, pool]
+    swap1              // [0xc4, cmdOffset, cmdLen, argsLen, pool]
+    calldatacopy       // [argsLen, pool]
+    // call(gas, pool, 0, 0, argsLen, 0, 64)
+    swap1              // [pool, argsLen]
+    0x40 swap2         // [argsLen, pool, 0x40]
+    0x00 swap2         // [pool, argsLen, 0x00, 0x40]
+    0x00 swap1         // [pool, 0x00, argsLen, 0x00, 0x40]
+    0x00 swap1         // [pool, 0x00, 0x00, argsLen, 0x00, 0x40]
+    gas call
+    iszero err jumpi
+}
+
+/// @notice V4 unlock(bytes)
+/// stack: [pm, cmdOffset, cmdLen]
+#define macro V4_UNLOCK_DEEP() = takes(3) returns(0) {
+    0x48c8949100000000000000000000000000000000000000000000000000000000 0x00 mstore
+    0x20 0x04 mstore   // bytes offset = 32
+    // stack: [pm, cmdOffset, cmdLen]
+    swap2              // [cmdLen, cmdOffset, pm]
+    dup1 0x24 mstore   // cmdLen at 36. [cmdLen, cmdOffset, pm]
+    dup1 0x44 add      // [argsLen, cmdLen, cmdOffset, pm]
+    swap2              // [cmdOffset, cmdLen, argsLen, pm]
+    0x44 swap1         // [cmdOffset, 0x44, cmdLen, argsLen, pm]
+    swap1              // [0x44, cmdOffset, cmdLen, argsLen, pm]
+    calldatacopy       // [argsLen, pm]
+    // call(gas, pm, 0, 0, argsLen, 0, 0)
+    swap1              // [pm, argsLen]
+    0x00 swap2         // [argsLen, pm, 0]
+    0x00 swap2         // [pm, argsLen, 0, 0]
+    0x00 swap1         // [pm, 0, argsLen, 0, 0]
+    0x00 swap1         // [pm, 0, 0, argsLen, 0, 0]
+    gas call
+    iszero err jumpi
+}
+
+// ============================================================
+// Dispatcher
+// ============================================================
+#define macro DISPATCHER() = takes(2) returns(0) {
+    // stack: [cursor, limit]
+    // Jump table already loaded at 0x500 by MAIN
+
+    dispatch_loop:
+        // stack: [cursor, limit]
+        dup2 dup2 lt iszero dispatch_done jumpi  // if cursor >= limit, done
+        // advance cursor past opcode byte + load opcode
+        dup1 0x01 add                   // stack: [cursor+1, cursor, limit]
+        swap1 calldataload 0x00 byte    // stack: [opcode, cursor+1, limit]
+        // lookup jump dest: table[opcode*2] (2 bytes)
+        0x01 shl                        // opcode * 2
+        0x500 add                       // memory offset
+        mload 0xf0 shr                  // 2-byte jump dest
+        jump
+
+    // ---- 0x0F: invalid (placeholder, should never be called) ----
+    cmd_invalid:
+        err jump
+
+    // ---- 0x08: wrap WETH (14 bytes, adaptive: 0 -> selfbalance) ----
+    cmd_wrap_weth:
+        // stack: [cursor, limit]
+        dup1 calldataload 0x90 shr      // amount (14 bytes = 112 bits, shift 256-112=144)
+        // adaptive: if amount == 0, use selfbalance
+        dup1 iszero wrap_adaptive jumpi
+        // explicit amount
+        DEPOSIT_WETH()
+        0x0e add
+        dispatch_loop jump
+
+        wrap_adaptive:
+        pop                             // drop 0
+        selfbalance                     // use contract's ETH balance
+        DEPOSIT_WETH()
+        0x0e add
+        dispatch_loop jump
+
+    // ---- 0x0A: unwrap WETH (14 bytes, adaptive: 0 -> balanceOf(WETH, this)) ----
+    cmd_unwrap_weth:
+        dup1 calldataload 0x90 shr      // amount (14 bytes)
+        dup1 iszero unwrap_adaptive jumpi
+        WITHDRAW_WETH()
+        0x0e add
+        dispatch_loop jump
+
+        unwrap_adaptive:
+        pop                             // drop 0
+        // BALANCE_OF expects [account, token] with account on TOP
+        // We want balanceOf(WETH, address()) — token=WETH, account=address()
+        [WETH]                          // [WETH, cursor, limit]
+        address                         // [address, WETH, cursor, limit]
+        BALANCE_OF()                    // [balance, cursor, limit]
+        WITHDRAW_WETH()
+        0x0e add
+        dispatch_loop jump
+
+    // ---- 0x09: bribe (9 bytes, unchanged) ----
+    cmd_bribe:
+        dup1 calldataload 0xb8 shr      // amount (9 bytes)
+        // call(gas, coinbase, amount, 0, 0, 0, 0)
+        0x00 0x00 0x00 0x00 swap4 coinbase
+        gas call
+        iszero err jumpi
+        0x09 add
+        dispatch_loop jump
+
+    // ---- 0x0B: transfer ETH (34 bytes: 14 amount + 20 address) ----
+    cmd_transfer_eth:
+        dup1 calldataload 0x90 shr      // amount (14 bytes)
+        dup2 0x0e add calldataload 0x60 shr  // account (20 bytes at cursor+14)
+        // call(gas, account, amount, 0, 0, 0, 0)
+        // stack: [account, amount, cursor, limit]
+        0x00 0x00 0x00 0x00
+        // stack: [0, 0, 0, 0, account, amount, cursor, limit]
+        swap5 swap1 swap4
+        // stack: [account, amount, 0, 0, 0, 0, cursor, limit]
+        gas call
+        iszero err jumpi
+        0x22 add            // cursor += 34
+        dispatch_loop jump
+
+    // ---- 0x0C: transfer ERC20 (54 bytes: 20 token + 20 account + 14 amount) ----
+    cmd_transfer_erc20:
+        dup1 calldataload 0x60 shr              // token (20 bytes)
+        dup2 0x28 add calldataload 0x90 shr     // amount (14 bytes at cursor+40)
+        dup3 0x14 add calldataload 0x60 shr     // account (20 bytes at cursor+20)
+        // stack: [account, amount, token, cursor, limit]
+        TRANSFER_TOKEN()
+        0x36 add            // cursor += 54
+        dispatch_loop jump
+
+    // ---- 0x0D: balance check (54 bytes: 20 account + 20 token + 14 amount) ----
+    cmd_balance_check:
+        // BALANCE_OF expects [account, token] with account on TOP
+        // Layout: account(20) + token(20) + minAmount(14)
+        dup1 calldataload 0x60 shr              // account (at cursor)
+        dup2 0x14 add calldataload 0x60 shr     // token (at cursor+20)
+        // stack: [token, account, cursor, limit]
+        swap1                                   // [account, token, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+        dup2 0x28 add calldataload 0x90 shr     // [required_amount, balance, cursor, limit]
+        // require(balance >= amount): if amount > balance, revert
+        gt err jumpi                            // if required > balance, revert
+        0x36 add            // cursor += 54
+        dispatch_loop jump
+
+    // ---- 0x0E: sweep (40 bytes: 20 token + 20 to) ----
+    cmd_sweep:
+        // Read token and to from calldata
+        dup1 calldataload 0x60 shr              // [token, cursor, limit]
+        dup2 0x14 add calldataload 0x60 shr     // [to, token, cursor, limit]
+        // balanceOf(token, address()): BALANCE_OF expects [account, token]
+        dup2                                    // [token, to, token, cursor, limit]
+        address                                 // [address, token, to, token, cursor, limit]
+        BALANCE_OF()                            // [balance, to, token, cursor, limit]
+        // if balance > 0, transfer
+        dup1 iszero sweep_skip jumpi
+        // TRANSFER_TOKEN expects [account, amount, token]
+        // stack: [balance, to, token, cursor, limit]
+        swap1                                   // [to, balance, token, cursor, limit]
+        // stack: [to=account, balance=amount, token, cursor, limit]
+        TRANSFER_TOKEN()
+        0x28 add            // cursor += 40
+        dispatch_loop jump
+
+        sweep_skip:
+        pop pop pop         // drop balance, to, token
+        0x28 add            // cursor += 40
+        dispatch_loop jump
+
+    // ---- 0x00: V2 adaptive swap zfo (60 bytes) ----
+    // Layout: selector(4) + fee_bps(2) + pair(20) + tokenIn(20) + amountIn(14) = 60
+    // Offsets from cursor: sel@0, feeBps@4, pair@6, tokenIn@26, amountIn@46
+    cmd_v2_swap_zfo:
+        // stack: [cursor, limit]
+
+        // Step 1: Read and resolve amountIn
+        dup1 0x2e add calldataload 0x90 shr     // [amountIn, cursor, limit] (14 bytes at cursor+46)
+        dup1 iszero v2_zfo_resolve jumpi
+        v2_zfo_resolved jump
+
+        v2_zfo_resolve:
+        pop                                     // [cursor, limit]
+        // BALANCE_OF expects [account, token]: account=address() on TOP, token=tokenIn below
+        dup1 0x1a add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        v2_zfo_resolved:
+        // stack: [amountIn, cursor, limit]
+        // Save amountIn to memory 0x600 so we can use it after getReserves clobbers mem
+        dup1 0x600 mstore                       // save amountIn
+
+        // Step 2: getReserves() on pair
+        0x0902f1ac00000000000000000000000000000000000000000000000000000000 0x00 mstore
+        // staticcall(gas, pair, argsOff=0, argsLen=4, retOff=0, retLen=64)
+        // Push order: argsOff, argsLen, retOff, retLen, then swap4 with pair
+        dup2 0x06 add calldataload 0x60 shr     // [pair, amountIn, cursor, limit]
+        0x00 0x04 0x00 0x40                     // [0x40, 0, 4, 0, pair, amountIn, cursor, limit]
+        swap4                                   // [pair, 0, 4, 0, 0x40, amountIn, cursor, limit]
+        gas staticcall
+        iszero err jumpi
+        // stack: [amountIn, cursor, limit]
+        // r0 = mload(0), r1 = mload(32)
+        // zfo=1: rIn=r0, rOut=r1
+        0x00 mload                              // [rIn, amountIn, cursor, limit]
+        0x20 mload                              // [rOut, rIn, amountIn, cursor, limit]
+
+        // Step 3: Compute amountOut = amtFee * rOut / (rIn * 10000 + amtFee)
+        //   where amtFee = amountIn * (10000 - feeBps)
+        // Read feeBps from calldata
+        dup4 0x04 add calldataload 0xf0 shr 0xFFFF and  // [feeBps, rOut, rIn, amountIn, cursor, limit]
+        0x2710 sub                              // [10000-feeBps, rOut, rIn, amountIn, cursor, limit]
+        // sub: a=0x2710(top after push), b=feeBps — wait, we did `0x2710 sub`
+        // stack was [feeBps, ...], push 0x2710 -> [0x2710, feeBps, ...], sub -> 0x2710-feeBps. Correct!
+        dup4 mul                                // [amtFee, rOut, rIn, amountIn, cursor, limit]
+        // numerator = amtFee * rOut
+        dup1 dup3 mul                           // [amtFee*rOut, amtFee, rOut, rIn, amountIn, cursor, limit]
+        // denominator = rIn * 10000 + amtFee
+        swap3                                   // [rIn, amtFee, rOut, amtFee*rOut, amountIn, cursor, limit]
+        0x2710 mul                              // [rIn*10000, amtFee, rOut, amtFee*rOut, amountIn, cursor, limit]
+        add                                     // [denom, rOut, amtFee*rOut, amountIn, cursor, limit]
+        swap2                                   // [amtFee*rOut, rOut, denom, amountIn, cursor, limit]
+        swap1 pop                               // [amtFee*rOut, denom, amountIn, cursor, limit]
+        div                                     // [amountOut, amountIn, cursor, limit]
+        // Save amountOut to memory 0x620
+        dup1 0x620 mstore
+
+        // Step 4: Transfer tokenIn to pair
+        // TRANSFER_TOKEN expects [account=pair, amount=amountIn, token=tokenIn]
+        pop                                     // [amountIn, cursor, limit]
+        // Re-read from calldata for clean stack
+        dup2 0x1a add calldataload 0x60 shr     // [tokenIn, amountIn, cursor, limit]
+        swap1                                   // [amountIn, tokenIn, cursor, limit]
+        dup3 0x06 add calldataload 0x60 shr     // [pair, amountIn, tokenIn, cursor, limit]
+        TRANSFER_TOKEN()                        // [cursor, limit]
+
+        // Step 5: swap_v2(sig, pair, 0, amountOut, address())
+        // SWAP_V2 expects [sig, pair, amount0, amount1, to]
+        // zfo: amount0=0, amount1=amountOut
+        address                                 // [to, cursor, limit]
+        0x620 mload                             // [amountOut, to, cursor, limit]
+        0x00                                    // [0, amountOut, to, cursor, limit]
+        dup4 0x06 add calldataload 0x60 shr     // [pair, 0, amountOut, to, cursor, limit]
+        dup5 calldataload 0xe0 shr              // [sig, pair, 0, amountOut, to, cursor, limit]
+        SWAP_V2()                               // [cursor, limit]
+        0x3c add
+        dispatch_loop jump
+
+    // ---- 0x01: V2 adaptive swap ofz (60 bytes) ----
+    // Layout: selector(4) + fee_bps(2) + pair(20) + tokenIn(20) + amountIn(14) = 60
+    cmd_v2_swap_ofz:
+        // stack: [cursor, limit]
+
+        // Step 1: Read and resolve amountIn
+        dup1 0x2e add calldataload 0x90 shr     // [amountIn, cursor, limit]
+        dup1 iszero v2_ofz_resolve jumpi
+        v2_ofz_resolved jump
+
+        v2_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x1a add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        v2_ofz_resolved:
+        // stack: [amountIn, cursor, limit]
+        dup1 0x600 mstore                       // save amountIn
+
+        // Step 2: getReserves() on pair
+        0x0902f1ac00000000000000000000000000000000000000000000000000000000 0x00 mstore
+        // staticcall(gas, pair, argsOff=0, argsLen=4, retOff=0, retLen=64)
+        dup2 0x06 add calldataload 0x60 shr     // [pair, amountIn, cursor, limit]
+        0x00 0x04 0x00 0x40                     // [0x40, 0, 4, 0, pair, amountIn, cursor, limit]
+        swap4                                   // [pair, 0, 4, 0, 0x40, amountIn, cursor, limit]
+        gas staticcall
+        iszero err jumpi
+        // stack: [amountIn, cursor, limit]
+        // ofz: zfo=0 -> rIn=r1, rOut=r0
+        0x20 mload                              // [rIn=r1, amountIn, cursor, limit]
+        0x00 mload                              // [rOut=r0, rIn, amountIn, cursor, limit]
+
+        // Step 3: Compute amountOut
+        dup4 0x04 add calldataload 0xf0 shr 0xFFFF and  // [feeBps, rOut, rIn, amountIn, cursor, limit]
+        0x2710 sub                              // [10000-feeBps, rOut, rIn, amountIn, cursor, limit]
+        dup4 mul                                // [amtFee, rOut, rIn, amountIn, cursor, limit]
+        dup1 dup3 mul                           // [amtFee*rOut, amtFee, rOut, rIn, amountIn, cursor, limit]
+        swap3                                   // [rIn, amtFee, rOut, amtFee*rOut, amountIn, cursor, limit]
+        0x2710 mul                              // [rIn*10000, amtFee, rOut, amtFee*rOut, amountIn, cursor, limit]
+        add                                     // [denom, rOut, amtFee*rOut, amountIn, cursor, limit]
+        swap2                                   // [amtFee*rOut, rOut, denom, amountIn, cursor, limit]
+        swap1 pop                               // [amtFee*rOut, denom, amountIn, cursor, limit]
+        div                                     // [amountOut, amountIn, cursor, limit]
+        dup1 0x620 mstore
+
+        // Step 4: Transfer tokenIn to pair
+        pop                                     // [amountIn, cursor, limit]
+        dup2 0x1a add calldataload 0x60 shr     // [tokenIn, amountIn, cursor, limit]
+        swap1                                   // [amountIn, tokenIn, cursor, limit]
+        dup3 0x06 add calldataload 0x60 shr     // [pair, amountIn, tokenIn, cursor, limit]
+        TRANSFER_TOKEN()                        // [cursor, limit]
+
+        // Step 5: swap_v2(sig, pair, amountOut, 0, address())
+        // SWAP_V2 expects [sig, pair, amount0, amount1, to]
+        // ofz: amount0=amountOut, amount1=0
+        address                                 // [to, cursor, limit]
+        0x00                                    // [0, to, cursor, limit]
+        0x620 mload                             // [amountOut, 0, to, cursor, limit]
+        dup4 0x06 add calldataload 0x60 shr     // [pair, amountOut, 0, to, cursor, limit]
+        dup5 calldataload 0xe0 shr              // [sig, pair, amountOut, 0, to, cursor, limit]
+        SWAP_V2()                               // [cursor, limit]
+        0x3c add
+        dispatch_loop jump
+
+    // ---- 0x02: V3 swap zfo (78 bytes, with resolve_amount) ----
+    // Layout: selector(4) + token0(20) + token1(20) + pool(20) + amount(14) = 78
+    cmd_v3_swap_zfo:
+        // Step 1: resolve amount
+        dup1 0x40 add calldataload 0x90 shr     // [amount, cursor, limit] (at cursor+64)
+        dup1 iszero v3_zfo_resolve jumpi
+        v3_zfo_resolved jump
+
+        v3_zfo_resolve:
+        pop                                     // [cursor, limit]
+        // BALANCE_OF [account, token]: token=token0, account=address()
+        dup1 0x04 add calldataload 0x60 shr     // [token0, cursor, limit]
+        address                                 // [address, token0, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        v3_zfo_resolved:
+        // stack: [amount, cursor, limit]
+        // SWAP_V3 needs [sig, pool, account, zfo, amount, priceLimit, token0, token1, amountIn]
+        // Push bottom-up: amountIn first (=amount), then token1, token0, priceLimit, amount, zfo, account, pool, sig
+        dup2 0x18 add calldataload 0x60 shr     // [token1, amount, cursor, limit]
+        dup3 0x04 add calldataload 0x60 shr     // [token0, token1, amount, cursor, limit]
+        [MIN_SQRT_RATIO_PLUS_1]                 // [priceLimit, token0, token1, amount, cursor, limit]
+        dup4                                    // [amount, priceLimit, token0, token1, amount, cursor, limit]
+        0x01                                    // [1, amount, priceLimit, token0, token1, amount, cursor, limit]
+        address                                 // [address, 1, amount, priceLimit, token0, token1, amount, cursor, limit]
+        dup8 0x2c add calldataload 0x60 shr     // [pool, address, 1, amount, priceLimit, token0, token1, amount, cursor, limit]
+        dup9 calldataload 0xe0 shr              // [sig, pool, address, 1, amount, priceLimit, token0, token1, amount, cursor, limit]
+        SWAP_V3()                               // SWAP_V3 consumes 9 (including original amount), leaves: [cursor, limit]
+        0x4e add
+        dispatch_loop jump
+
+    // ---- 0x03: V3 swap ofz (78 bytes, with resolve_amount) ----
+    cmd_v3_swap_ofz:
+        // Step 1: resolve amount (for token1)
+        dup1 0x40 add calldataload 0x90 shr     // [amount, cursor, limit]
+        dup1 iszero v3_ofz_resolve jumpi
+        v3_ofz_resolved jump
+
+        v3_ofz_resolve:
+        pop                                     // [cursor, limit]
+        // BALANCE_OF [account, token]: token=token1, account=address()
+        dup1 0x18 add calldataload 0x60 shr     // [token1, cursor, limit]
+        address                                 // [address, token1, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        v3_ofz_resolved:
+        // stack: [amount, cursor, limit]
+        dup2 0x18 add calldataload 0x60 shr     // [token1, amount, cursor, limit]
+        dup3 0x04 add calldataload 0x60 shr     // [token0, token1, amount, cursor, limit]
+        [MAX_SQRT_RATIO_MINUS_1]                // [priceLimit, token0, token1, amount, cursor, limit]
+        dup4                                    // [amount, priceLimit, token0, token1, amount, cursor, limit]
+        0x00                                    // [0, amount, priceLimit, token0, token1, amount, cursor, limit]
+        address                                 // [address, 0, amount, priceLimit, token0, token1, amount, cursor, limit]
+        dup8 0x2c add calldataload 0x60 shr     // [pool, address, 0, amount, priceLimit, token0, token1, amount, cursor, limit]
+        dup9 calldataload 0xe0 shr              // [sig, pool, address, 0, amount, priceLimit, token0, token1, amount, cursor, limit]
+        SWAP_V3()                               // SWAP_V3 consumes 9 (including original amount), leaves: [cursor, limit]
+        0x4e add
+        dispatch_loop jump
+
+    // ---- 0x04: Balancer V2 zfo (110 bytes, with resolve_amount) ----
+    // Layout: selector(4) + vault(20) + poolId(32) + token0(20) + token1(20) + amount0(14) = 110
+    cmd_bal_swap_zfo:
+        // Step 1: resolve amount0
+        dup1 0x60 add calldataload 0x90 shr     // [amount0, cursor, limit] (at cursor+96)
+        dup1 iszero bal_zfo_resolve jumpi
+        bal_zfo_resolved jump
+
+        bal_zfo_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x38 add calldataload 0x60 shr     // [token0, cursor, limit] (at cursor+56)
+        address                                 // [address, token0, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        bal_zfo_resolved:
+        // stack: [amount0, cursor, limit]
+        // Step 2: approve_token(token0, vault, amount0)
+        // APPROVE_TOKEN expects [spender=vault, amount=amount0, token=token0]
+        dup2 0x38 add calldataload 0x60 shr     // [token0, amount0, cursor, limit]
+        dup2                                    // [amount0, token0, amount0, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [vault, amount0, token0, amount0, cursor, limit]
+        APPROVE_TOKEN()                         // [amount0, cursor, limit]
+
+        // Step 3: SWAP_V2_BALANCER [sig, poolId, assetIn=token0, assetOut=token1, amountIn=amount0, vault]
+        dup2 0x04 add calldataload 0x60 shr     // [vault, amount0, cursor, limit]
+        swap1                                   // [amount0, vault, cursor, limit]
+        dup3 0x4c add calldataload 0x60 shr     // [token1, amount0, vault, cursor, limit]
+        dup4 0x38 add calldataload 0x60 shr     // [token0, token1, amount0, vault, cursor, limit]
+        dup5 0x18 add calldataload              // [poolId, token0, token1, amount0, vault, cursor, limit]
+        dup6 calldataload 0xe0 shr              // [sig, poolId, token0, token1, amount0, vault, cursor, limit]
+        SWAP_V2_BALANCER()                      // [cursor, limit]
+        0x6e add
+        dispatch_loop jump
+
+    // ---- 0x05: Balancer V2 ofz (110 bytes, with resolve_amount) ----
+    cmd_bal_swap_ofz:
+        // Step 1: resolve amount1
+        dup1 0x60 add calldataload 0x90 shr     // [amount1, cursor, limit] (at cursor+96)
+        dup1 iszero bal_ofz_resolve jumpi
+        bal_ofz_resolved jump
+
+        bal_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x4c add calldataload 0x60 shr     // [token1, cursor, limit] (at cursor+76)
+        address                                 // [address, token1, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        bal_ofz_resolved:
+        // stack: [amount1, cursor, limit]
+        // Step 2: approve_token(token1, vault, amount1)
+        dup2 0x4c add calldataload 0x60 shr     // [token1, amount1, cursor, limit]
+        dup2                                    // [amount1, token1, amount1, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [vault, amount1, token1, amount1, cursor, limit]
+        APPROVE_TOKEN()                         // [amount1, cursor, limit]
+
+        // Step 3: SWAP_V2_BALANCER [sig, poolId, assetIn=token1, assetOut=token0, amountIn=amount1, vault]
+        dup2 0x04 add calldataload 0x60 shr     // [vault, amount1, cursor, limit]
+        swap1                                   // [amount1, vault, cursor, limit]
+        dup3 0x38 add calldataload 0x60 shr     // [token0=assetOut, amount1, vault, cursor, limit]
+        dup4 0x4c add calldataload 0x60 shr     // [token1=assetIn, token0, amount1, vault, cursor, limit]
+        dup5 0x18 add calldataload              // [poolId, token1, token0, amount1, vault, cursor, limit]
+        dup6 calldataload 0xe0 shr              // [sig, poolId, token1, token0, amount1, vault, cursor, limit]
+        SWAP_V2_BALANCER()                      // [cursor, limit]
+        0x6e add
+        dispatch_loop jump
+
+    // ---- 0x06: Curve zfo (70 bytes, with resolve_amount) ----
+    // Layout: sig(4) pool(20) idx0(6) idx1(6) tokenIn(20) amountIn(14) = 70
+    cmd_curve_zfo:
+        // Step 1: resolve amount
+        dup1 0x38 add calldataload 0x90 shr     // [amount0, cursor, limit] (at cursor+56)
+        dup1 iszero curve_zfo_resolve jumpi
+        curve_zfo_resolved jump
+
+        curve_zfo_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x24 add calldataload 0x60 shr     // [token0, cursor, limit] (at cursor+36)
+        address                                 // [address, token0, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        curve_zfo_resolved:
+        // stack: [amount0, cursor, limit]
+        // Check if native ETH
+        dup2 0x24 add calldataload 0x60 shr     // [token0, amount0, cursor, limit]
+        dup1 iszero curve_zfo_eth_path jumpi
+
+        // ERC20 path: safe_approve_token(token0, pool, amount0)
+        // SAFE_APPROVE_TOKEN [spender=pool, amount=amount0, token=token0]
+        // stack: [token0, amount0, cursor, limit]
+        dup2                                    // [amount0, token0, amount0, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount0, token0, amount0, cursor, limit]
+        SAFE_APPROVE_TOKEN()                    // [amount0, cursor, limit]
+        // swap_curve_exec(sig, pool, idx0=sellId, idx1=buyId, amount0)
+        // SWAP_CURVE_EXEC [sig, pool, sellId, buyId, amount] — push from bottom
+        dup2 0x04 add calldataload 0xFFFFFFFFFFFF and                  // [idx1=buyId, amount0, cursor, limit]
+        dup3 0x04 add calldataload 0x30 shr 0xFFFFFFFFFFFF and        // [idx0=sellId, idx1, amount0, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr                            // [pool, idx0, idx1, amount0, cursor, limit]
+        dup5 calldataload 0xe0 shr                                     // [sig, pool, idx0, idx1, amount0, cursor, limit]
+        SWAP_CURVE_EXEC()                       // [cursor, limit]
+        0x46 add
+        dispatch_loop jump
+
+    curve_zfo_eth_path:
+        pop                                     // drop token0=0. [amount0, cursor, limit]
+        // ETH path: no approve, swap with value
+        dup2 0x04 add calldataload 0xFFFFFFFFFFFF and
+        dup3 0x04 add calldataload 0x30 shr 0xFFFFFFFFFFFF and
+        dup4 0x04 add calldataload 0x60 shr
+        dup5 calldataload 0xe0 shr
+        SWAP_CURVE_ETH_EXEC()
+        0x46 add
+        dispatch_loop jump
+
+    // ---- 0x07: Curve ofz (70 bytes, with resolve_amount) ----
+    cmd_curve_ofz:
+        // Step 1: resolve amount
+        dup1 0x38 add calldataload 0x90 shr     // [amount1, cursor, limit]
+        dup1 iszero curve_ofz_resolve jumpi
+        curve_ofz_resolved jump
+
+        curve_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x24 add calldataload 0x60 shr     // [token1, cursor, limit]
+        address                                 // [address, token1, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        curve_ofz_resolved:
+        // stack: [amount1, cursor, limit]
+        dup2 0x24 add calldataload 0x60 shr     // [token1, amount1, cursor, limit]
+        dup1 iszero curve_ofz_eth_path jumpi
+
+        // ERC20 path: safe_approve_token(token1, pool, amount1)
+        // stack: [token1, amount1, cursor, limit]
+        dup2                                    // [amount1, token1, amount1, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount1, token1, amount1, cursor, limit]
+        SAFE_APPROVE_TOKEN()                    // [amount1, cursor, limit]
+        // swap_curve_exec(sig, pool, idx1=sellId, idx0=buyId, amount1) — indices swapped for ofz
+        dup2 0x04 add calldataload 0x30 shr 0xFFFFFFFFFFFF and        // [idx0=buyId, amount1, cursor, limit]
+        dup3 0x04 add calldataload 0xFFFFFFFFFFFF and                  // [idx1=sellId, idx0, amount1, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr                            // [pool, idx1, idx0, amount1, cursor, limit]
+        dup5 calldataload 0xe0 shr                                     // [sig, pool, idx1, idx0, amount1, cursor, limit]
+        SWAP_CURVE_EXEC()                       // [cursor, limit]
+        0x46 add
+        dispatch_loop jump
+
+    curve_ofz_eth_path:
+        pop                                     // drop token1=0. [amount1, cursor, limit]
+        dup2 0x04 add calldataload 0x30 shr 0xFFFFFFFFFFFF and        // idx0=buyId
+        dup3 0x04 add calldataload 0xFFFFFFFFFFFF and                  // idx1=sellId
+        dup4 0x04 add calldataload 0x60 shr
+        dup5 calldataload 0xe0 shr
+        SWAP_CURVE_ETH_EXEC()
+        0x46 add
+        dispatch_loop jump
+
+    // ---- 0x10: V2 flash zfo (41 + inner) ----
+    // Layout: selector(4) + amount(14) + pair(20) + innerLen(3) [inner...] = 41 + inner
+    cmd_v2_flash_z:
+        dup1 0x26 add calldataload 0xe8 shr     // [innerLen, cursor, limit]
+        // FLASH_V2_DEEP [sig, pair, amount0, amount1=0, cmdOffset, cmdLen] — push bottom-up
+        dup1                                     // cmdLen
+        dup3 0x29 add                            // cmdOffset = cursor+41
+        0x00                                     // amount1 = 0
+        dup5 0x04 add calldataload 0x90 shr      // amount0 = amount
+        dup6 0x12 add calldataload 0x60 shr      // pair (cursor+18)
+        dup7 calldataload 0xe0 shr               // sig
+        FLASH_V2_DEEP()
+        0x29 add add
+        dispatch_loop jump
+
+    // ---- 0x11: V2 flash ofz (41 + inner) ----
+    cmd_v2_flash_o:
+        dup1 0x26 add calldataload 0xe8 shr     // [innerLen, cursor, limit]
+        dup1                                     // cmdLen
+        dup3 0x29 add                            // cmdOffset = cursor+41
+        dup4 0x04 add calldataload 0x90 shr      // amount1 = amount
+        0x00                                     // amount0 = 0
+        dup6 0x12 add calldataload 0x60 shr      // pair (cursor+18)
+        dup7 calldataload 0xe0 shr               // sig
+        FLASH_V2_DEEP()
+        0x29 add add
+        dispatch_loop jump
+
+    // ---- 0x12: V3 flash swap zfo (41 + inner) ----
+    cmd_v3_flash_swap_z:
+        dup1 0x26 add calldataload 0xe8 shr     // [innerLen, cursor, limit]
+        // FLASH_SWAP_V3_DEEP [sig, pool, zfo=1, amount, priceLimit, cmdOffset, cmdLen]
+        dup1                                     // cmdLen
+        dup3 0x29 add                            // cmdOffset = cursor+41
+        [MIN_SQRT_RATIO_PLUS_1]                  // priceLimit
+        dup5 0x04 add calldataload 0x90 shr      // amount (cursor+4)
+        0x01                                     // zeroForOne = 1
+        dup7 0x12 add calldataload 0x60 shr      // pool (cursor+18)
+        dup8 calldataload 0xe0 shr               // sig
+        FLASH_SWAP_V3_DEEP()
+        0x29 add add
+        dispatch_loop jump
+
+    // ---- 0x13: V3 flash swap ofz (41 + inner) ----
+    cmd_v3_flash_swap_o:
+        dup1 0x26 add calldataload 0xe8 shr     // [innerLen, cursor, limit]
+        dup1                                     // cmdLen
+        dup3 0x29 add                            // cmdOffset = cursor+41
+        [MAX_SQRT_RATIO_MINUS_1]                 // priceLimit
+        dup5 0x04 add calldataload 0x90 shr      // amount (cursor+4)
+        0x00                                     // zeroForOne = 0
+        dup7 0x12 add calldataload 0x60 shr      // pool (cursor+18)
+        dup8 calldataload 0xe0 shr               // sig
+        FLASH_SWAP_V3_DEEP()
+        0x29 add add
+        dispatch_loop jump
+
+    // ---- 0x14: V4 unlock (23 + inner) ----
+    // Layout: pm(20) innerLen(3) [inner...] = 23 + inner
+    cmd_v4_unlock:
+        dup1 0x14 add calldataload 0xe8 shr     // [innerLen, cursor, limit]
+        // V4_UNLOCK_DEEP [pm, cmdOffset, cmdLen]
+        dup1                                     // cmdLen
+        dup3 0x17 add                            // cmdOffset = cursor+23
+        dup4 calldataload 0x60 shr               // pm
+        V4_UNLOCK_DEEP()
+        // stack: [innerLen, cursor, limit]
+        0x17 add add                             // cursor += innerLen + 23
+        dispatch_loop jump
+
+    // ---- 0x15: V4 swap zfo (100 bytes) ----
+    // Layout: pm(20) currency0(20) currency1(20) fee(3) tickSpacing(3) hooks(20) amount(14) = 100
+    cmd_v4_swap_zfo:
+        // resolve amount: zfo tokenIn = currency0. amount=0 → balanceOf/selfbalance
+        dup1 0x56 add calldataload 0x90 shr                          // [amount, cursor, limit]
+        dup1 iszero v4_swap_zfo_resolve jumpi
+        v4_swap_zfo_resolved jump
+
+        v4_swap_zfo_resolve:
+        pop                                                           // [cursor, limit]
+        dup1 0x14 add calldataload 0x60 shr                          // [currency0, cursor, limit]
+        dup1 iszero v4_swap_zfo_eth jumpi
+        // ERC20: balanceOf(this, currency0)
+        address BALANCE_OF()                                          // [balance, cursor, limit]
+        v4_swap_zfo_resolved jump
+        v4_swap_zfo_eth:
+        pop selfbalance                                               // [balance, cursor, limit]
+
+        v4_swap_zfo_resolved:
+        // stack: [amount, cursor, limit]
+        // V4_SWAP_EXEC [pm, currency0, currency1, fee, tickSpacing, hooks, zeroForOne, amount]
+        0x01                                                          // zeroForOne = 1
+        dup3 0x42 add calldataload 0x60 shr                          // hooks
+        dup4 0x3f add calldataload 0xe8 shr 0x02 signextend          // tickSpacing
+        dup5 0x3c add calldataload 0xe8 shr                          // fee
+        dup6 0x28 add calldataload 0x60 shr                          // currency1
+        dup7 0x14 add calldataload 0x60 shr                          // currency0
+        dup8 calldataload 0x60 shr                                   // pm
+        V4_SWAP_EXEC()
+        0x64 add
+        dispatch_loop jump
+
+    // ---- 0x16: V4 swap ofz (100 bytes) ----
+    cmd_v4_swap_ofz:
+        // resolve amount: ofz tokenIn = currency1. amount=0 → balanceOf/selfbalance
+        dup1 0x56 add calldataload 0x90 shr                          // [amount, cursor, limit]
+        dup1 iszero v4_swap_ofz_resolve jumpi
+        v4_swap_ofz_resolved jump
+
+        v4_swap_ofz_resolve:
+        pop                                                           // [cursor, limit]
+        dup1 0x28 add calldataload 0x60 shr                          // [currency1, cursor, limit]
+        dup1 iszero v4_swap_ofz_eth jumpi
+        // ERC20: balanceOf(this, currency1)
+        address BALANCE_OF()                                          // [balance, cursor, limit]
+        v4_swap_ofz_resolved jump
+        v4_swap_ofz_eth:
+        pop selfbalance                                               // [balance, cursor, limit]
+
+        v4_swap_ofz_resolved:
+        // stack: [amount, cursor, limit]
+        0x00                                                          // zeroForOne = 0
+        dup3 0x42 add calldataload 0x60 shr                          // hooks
+        dup4 0x3f add calldataload 0xe8 shr 0x02 signextend          // tickSpacing
+        dup5 0x3c add calldataload 0xe8 shr                          // fee
+        dup6 0x28 add calldataload 0x60 shr                          // currency1
+        dup7 0x14 add calldataload 0x60 shr                          // currency0
+        dup8 calldataload 0x60 shr                                   // pm
+        V4_SWAP_EXEC()
+        0x64 add
+        dispatch_loop jump
+
+    // ---- 0x17: V4 settle (54 bytes) ----
+    // Layout: pm(20) token(20) amount(14) = 54
+    cmd_v4_settle:
+        dup1 0x14 add calldataload 0x60 shr     // [token, cursor, limit]
+        dup1 iszero v4_settle_eth jumpi
+        // ---- ERC20 path ----
+        // 1. sync(token): call(gas, pm, 0, 0, 36, 0, 0)
+        0xa584119400000000000000000000000000000000000000000000000000000000 0x00 mstore
+        dup1 0x04 mstore                         // token at mem[4]
+        0x00 0x00 0x24 0x00 0x00                 // stack: [..., token, cursor, limit]
+        dup7 calldataload 0x60 shr               // pm
+        gas call iszero err jumpi
+        // stack: [token, cursor, limit]
+        // 2. resolve amount: amount=0 → balanceOf(this, token)
+        dup2 0x28 add calldataload 0x90 shr      // [amount, token, cursor, limit]
+        dup1 iszero v4_settle_erc20_resolve jumpi
+        v4_settle_erc20_resolved jump
+
+        v4_settle_erc20_resolve:
+        pop                                      // [token, cursor, limit]
+        dup1                                     // [token, token, cursor, limit]
+        address                                  // [address, token, token, cursor, limit]
+        BALANCE_OF()                             // [balance, token, cursor, limit]
+
+        v4_settle_erc20_resolved:
+        // stack: [amount, token, cursor, limit]
+        // 3. transfer_token(token, pm, amount) -> TRANSFER_TOKEN [account, amount, token]
+        //    TRANSFER_TOKEN takes [account, amount, token] and pops all 3
+        dup3 calldataload 0x60 shr               // [pm, amount, token, cursor, limit]
+        TRANSFER_TOKEN()
+        // stack: [cursor, limit]
+        // 4. settle(): call(gas, pm, 0, 0, 4, 0, 32)
+        0x11da60b400000000000000000000000000000000000000000000000000000000 0x00 mstore
+        0x20 0x00 0x04 0x00 0x00
+        dup6 calldataload 0x60 shr               // pm
+        gas call iszero err jumpi
+        0x36 add
+        dispatch_loop jump
+
+    v4_settle_eth:
+        // ETH path: settle{value: amount}(): call(gas, pm, amount, 0, 4, 0, 32)
+        pop                                      // drop token=0. [cursor, limit]
+        0x11da60b400000000000000000000000000000000000000000000000000000000 0x00 mstore
+        0x20 0x00 0x04 0x00                      // [0, 4, 0, 0x20, cursor, limit]
+        dup5 0x28 add calldataload 0x90 shr      // [amount, 0, 4, 0, 0x20, cursor, limit]
+        // amount=0 → selfbalance()
+        dup1 iszero v4_settle_eth_resolve jumpi
+        v4_settle_eth_resolved jump
+
+        v4_settle_eth_resolve:
+        pop selfbalance                          // [selfbalance, 0, 4, 0, 0x20, cursor, limit]
+
+        v4_settle_eth_resolved:
+        dup6 calldataload 0x60 shr               // [pm, amount, 0, 4, 0, 0x20, cursor, limit]
+        gas call iszero err jumpi
+        0x36 add
+        dispatch_loop jump
+
+    // ---- 0x18: V4 take (54 bytes) ----
+    // Layout: pm(20) token(20) amount(14) = 54
+    // take(address token, address recipient, uint256 amount)
+    cmd_v4_take:
+        0x0b0d9c0900000000000000000000000000000000000000000000000000000000 0x00 mstore
+        dup1 0x14 add calldataload 0x60 shr     // [token, cursor, limit]
+        0x04 mstore                              // token at mem[4]. [cursor, limit]
+        address 0x24 mstore                      // recipient at mem[36]
+        dup1 0x28 add calldataload 0x90 shr     // [amount, cursor, limit]
+        0x44 mstore                              // amount at mem[68]. [cursor, limit]
+        // call(gas, pm, 0, 0, 100, 0, 0)
+        0x00 0x00 0x64 0x00 0x00
+        dup6 calldataload 0x60 shr               // pm
+        gas call iszero err jumpi
+        0x36 add
+        dispatch_loop jump
+
+    // ---- 0x19: Balancer V1 zfo (78 bytes, with resolve_amount) ----
+    // Layout: selector(4) + pool(20) + tokenIn(20) + tokenOut(20) + amount(14) = 78
+    cmd_bal_v1_zfo:
+        // Step 1: resolve amount
+        dup1 0x40 add calldataload 0x90 shr     // [amount, cursor, limit] (at cursor+64)
+        dup1 iszero bv1_zfo_resolve jumpi
+        bv1_zfo_resolved jump
+
+        bv1_zfo_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x18 add calldataload 0x60 shr     // [tokenIn, cursor, limit] (at cursor+24)
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        bv1_zfo_resolved:
+        // stack: [amount, cursor, limit]
+        // Step 2: safe_approve_token(tokenIn, pool, amount)
+        // SAFE_APPROVE_TOKEN [spender=pool, amount, token=tokenIn]
+        dup2 0x18 add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        SAFE_APPROVE_TOKEN()                    // [amount, cursor, limit]
+
+        // Step 3: SWAP_BAL_V1_EXEC [sig, pool, tokenIn, amount, tokenOut]
+        dup2 0x2c add calldataload 0x60 shr     // [tokenOut, amount, cursor, limit]
+        swap1                                   // [amount, tokenOut, cursor, limit]
+        dup3 0x18 add calldataload 0x60 shr     // [tokenIn, amount, tokenOut, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, tokenIn, amount, tokenOut, cursor, limit]
+        dup5 calldataload 0xe0 shr              // [sig, pool, tokenIn, amount, tokenOut, cursor, limit]
+        SWAP_BAL_V1_EXEC()                      // [cursor, limit]
+        0x4e add
+        dispatch_loop jump
+
+    // ---- 0x1A: Balancer V1 ofz (78 bytes, with resolve_amount) ----
+    // Layout: selector(4) + pool(20) + tokenOut(20) + tokenIn(20) + amount(14) = 78
+    // Note: tokenOut/tokenIn swapped by RouteSimulator's pack function
+    cmd_bal_v1_ofz:
+        // Step 1: resolve amount
+        dup1 0x40 add calldataload 0x90 shr     // [amount, cursor, limit]
+        dup1 iszero bv1_ofz_resolve jumpi
+        bv1_ofz_resolved jump
+
+        bv1_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x2c add calldataload 0x60 shr     // [tokenIn, cursor, limit] (at cursor+44)
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        bv1_ofz_resolved:
+        // stack: [amount, cursor, limit]
+        // Step 2: safe_approve_token(tokenIn, pool, amount)
+        dup2 0x2c add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        SAFE_APPROVE_TOKEN()                    // [amount, cursor, limit]
+
+        // Step 3: SWAP_BAL_V1_EXEC [sig, pool, tokenIn, amount, tokenOut]
+        dup2 0x18 add calldataload 0x60 shr     // [tokenOut, amount, cursor, limit] (at cursor+24)
+        swap1                                   // [amount, tokenOut, cursor, limit]
+        dup3 0x2c add calldataload 0x60 shr     // [tokenIn, amount, tokenOut, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, tokenIn, amount, tokenOut, cursor, limit]
+        dup5 calldataload 0xe0 shr              // [sig, pool, tokenIn, amount, tokenOut, cursor, limit]
+        SWAP_BAL_V1_EXEC()                      // [cursor, limit]
+        0x4e add
+        dispatch_loop jump
+
+    // ---- 0x1B: Fluid zfo (58 bytes, with resolve_amount) ----
+    // Layout: selector(4) + pool(20) + tokenIn(20) + amount(14) = 58
+    cmd_fluid_zfo:
+        // Step 1: resolve amount
+        dup1 0x2c add calldataload 0x90 shr     // [amount, cursor, limit] (at cursor+44)
+        dup1 iszero fluid_zfo_resolve jumpi
+        fluid_zfo_resolved jump
+
+        fluid_zfo_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x18 add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        fluid_zfo_resolved:
+        // stack: [amount, cursor, limit]
+        // Step 2: transfer_token(tokenIn, pool, amount)
+        // TRANSFER_TOKEN [account=pool, amount, token=tokenIn]
+        dup2 0x18 add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        TRANSFER_TOKEN()                        // [amount, cursor, limit]
+
+        // Step 3: SWAP_FLUID_EXEC [sig, pool, zfo=1, amount]
+        0x01                                    // [1, amount, cursor, limit]
+        dup3 0x04 add calldataload 0x60 shr     // [pool, 1, amount, cursor, limit]
+        dup4 calldataload 0xe0 shr              // [sig, pool, 1, amount, cursor, limit]
+        SWAP_FLUID_EXEC()                       // [cursor, limit]
+        0x3a add
+        dispatch_loop jump
+
+    // ---- 0x1C: Fluid ofz (58 bytes, with resolve_amount) ----
+    cmd_fluid_ofz:
+        dup1 0x2c add calldataload 0x90 shr     // [amount, cursor, limit]
+        dup1 iszero fluid_ofz_resolve jumpi
+        fluid_ofz_resolved jump
+
+        fluid_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x18 add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        fluid_ofz_resolved:
+        // stack: [amount, cursor, limit]
+        // Step 2: transfer_token(tokenIn, pool, amount)
+        dup2 0x18 add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        TRANSFER_TOKEN()                        // [amount, cursor, limit]
+
+        // Step 3: SWAP_FLUID_EXEC [sig, pool, zfo=0, amount]
+        0x00                                    // [0, amount, cursor, limit]
+        dup3 0x04 add calldataload 0x60 shr     // [pool, 0, amount, cursor, limit]
+        dup4 calldataload 0xe0 shr              // [sig, pool, 0, amount, cursor, limit]
+        SWAP_FLUID_EXEC()                       // [cursor, limit]
+        0x3a add
+        dispatch_loop jump
+
+    // ---- 0x1D: DODO zfo (58 bytes, with resolve_amount) ----
+    // Layout: selector(4) + pool(20) + tokenIn(20) + amount(14) = 58
+    cmd_dodo_zfo:
+        dup1 0x2c add calldataload 0x90 shr     // [amount, cursor, limit]
+        dup1 iszero dodo_zfo_resolve jumpi
+        dodo_zfo_resolved jump
+
+        dodo_zfo_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x18 add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        dodo_zfo_resolved:
+        // stack: [amount, cursor, limit]
+        // Step 2: transfer_token(tokenIn, pool, amount)
+        dup2 0x18 add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        TRANSFER_TOKEN()                        // [amount, cursor, limit]
+        pop                                     // [cursor, limit] — DODO ignores amount in swap call
+
+        // Step 3: SWAP_DODO_EXEC [sig, pool]
+        dup1 0x04 add calldataload 0x60 shr     // [pool, cursor, limit]
+        dup2 calldataload 0xe0 shr              // [sig, pool, cursor, limit]
+        SWAP_DODO_EXEC()                        // [cursor, limit]
+        0x3a add
+        dispatch_loop jump
+
+    // ---- 0x1E: DODO ofz (58 bytes, with resolve_amount) ----
+    cmd_dodo_ofz:
+        dup1 0x2c add calldataload 0x90 shr     // [amount, cursor, limit]
+        dup1 iszero dodo_ofz_resolve jumpi
+        dodo_ofz_resolved jump
+
+        dodo_ofz_resolve:
+        pop                                     // [cursor, limit]
+        dup1 0x18 add calldataload 0x60 shr     // [tokenIn, cursor, limit]
+        address                                 // [address, tokenIn, cursor, limit]
+        BALANCE_OF()                            // [balance, cursor, limit]
+
+        dodo_ofz_resolved:
+        // stack: [amount, cursor, limit]
+        dup2 0x18 add calldataload 0x60 shr     // [tokenIn, amount, cursor, limit]
+        dup2                                    // [amount, tokenIn, amount, cursor, limit]
+        dup4 0x04 add calldataload 0x60 shr     // [pool, amount, tokenIn, amount, cursor, limit]
+        TRANSFER_TOKEN()                        // [amount, cursor, limit]
+        pop                                     // [cursor, limit]
+
+        dup1 0x04 add calldataload 0x60 shr     // [pool, cursor, limit]
+        dup2 calldataload 0xe0 shr              // [sig, pool, cursor, limit]
+        SWAP_DODO_EXEC()                        // [cursor, limit]
+        0x3a add
+        dispatch_loop jump
+
+    dispatch_done:
+        pop pop
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+#define macro MAIN() = takes(0) returns(0) {
+    // receive: calldatasize == 0
+    calldatasize iszero receive jumpi
+
+    // Load jump table ONCE for all dispatch paths
+    __tablesize(COMMAND_TABLE) __tablestart(COMMAND_TABLE) 0x500 codecopy
+
+    // operator dispatch: callvalue > 0
+    callvalue
+    dup1 iszero selector_switch jumpi
+    // check operator (multi-operator auth)
+    CHECK_OPERATOR()
+    // dispatcher(0, value) — value is the "limit" (byte length encoded in value)
+    // stack: [value]. Push 0 -> [0, value] = [cursor, limit]
+    0x00
+    dispatch_loop jump
+
+    selector_switch:
+    pop
+    // callback path: callvalue == 0, must be operator-initiated tx
+    CHECK_OPERATOR()
+    // Read selector
+    0x00 calldataload 0xe0 shr
+    // V3 flash loan callback (explicit selector)
+    dup1 0xe9cbafb0 eq flash_loan_cb jumpi
+    // V4 unlock callback (explicit selector)
+    dup1 0x91dd7346 eq v4_unlock_cb jumpi
+    pop
+
+    // === Dynamic callback detection via calldata layout ===
+    // Try V2 first (calldatasize >= 164), then V3 (calldatasize >= 132).
+    0xa4 calldatasize lt iszero try_v2_layout jumpi
+    try_v3_layout jump
+
+    try_v2_layout:
+        0x64 calldataload           // [v2_off]
+        0x04 add                    // [v2_data_pos]
+        dup1 0x20 add
+        calldatasize lt v2_fail jumpi
+        dup1 calldataload           // [v2_len, v2_data_pos]
+        0x1f add 0x1f not and      // [v2_padded, v2_data_pos]
+        swap1 0x20 add
+        add
+        calldatasize eq iszero v2_no_match jumpi
+        v2_flash_cb jump
+
+    v2_no_match:
+        try_v3_layout jump
+
+    v2_fail:
+        pop
+
+    try_v3_layout:
+    0x84 calldatasize lt iszero try_v3_check jumpi
+    // no match — revert
+    0x00 0x00 revert
+
+    try_v3_check:
+        0x44 calldataload
+        0x04 add
+        dup1 0x20 add
+        calldatasize lt v3_fail jumpi
+        dup1 calldataload
+        0x1f add 0x1f not and
+        swap1 0x20 add
+        add
+        calldatasize eq iszero v3_no_match jumpi
+        swap_v3_cb jump
+
+    v3_no_match:
+        no_match_revert jump
+    v3_fail:
+        pop
+    no_match_revert:
+    0x00 0x00 revert
+
+    // === Callback entry points ===
+
+    flash_loan_cb:
+        pop                         // drop selector
+        calldatasize 0xaf
+        dispatch_loop jump
+
+    swap_v3_cb:
+        0x64 calldataload           // [dataLen]
+        dup1 0x38 eq normal_v3_swap jumpi
+        // flash: dispatcher(132, 132 + dataLen)
+        0x84 add 0x84
+        dispatch_loop jump
+
+        normal_v3_swap:
+        pop
+        0x84 calldataload 0x60 shr
+        0x98 calldataload 0x60 shr
+        0xac calldataload 0x00 byte
+        0xad calldataload 0x90 shr
+        // stack: [amount, zfo, token1, token0]
+        swap2
+        swap1
+        iszero v3_cb_transfer_token1 jumpi
+        pop
+        caller
+        TRANSFER_TOKEN()
+        stop
+
+        v3_cb_transfer_token1:
+        swap2 pop
+        caller
+        TRANSFER_TOKEN()
+        stop
+
+    v4_unlock_cb:
+        pop                         // drop selector
+        0x24 calldataload
+        0x44 add
+        0x44
+        0x01 0x4e0 mstore           // set V4 return flag
+        dispatch_loop jump
+
+    v2_flash_cb:
+        0x84 calldataload
+        0xa4 add 0xa4
+        dispatch_loop jump
+
+    // ========== THE ONE AND ONLY DISPATCHER ==========
+    DISPATCHER()
+    // After dispatch_done pop pop, execution falls through here:
+
+    // Check V4 return flag: if set, return ABI-encoded empty bytes.
+    0x4e0 mload dispatch_v4_ret jumpi
+    stop
+
+    dispatch_v4_ret:
+        0x00 0x4e0 mstore       // clear flag
+        0x20 0x00 mstore
+        0x00 0x20 mstore
+        0x40 0x00 return
+
+    receive:
+        stop
+
+    err:
+        0x00 0x00 revert
+}
+
+// ============================================================
+// CONSTRUCTOR — deploy runtime code
+// ============================================================
+#define macro CONSTRUCTOR() = takes(0) returns(0) {
+    __codesize(CONSTRUCTOR) codesize sub
+    dup1
+    __codesize(CONSTRUCTOR)
+    0x00
+    codecopy
+    0x00 return
+}

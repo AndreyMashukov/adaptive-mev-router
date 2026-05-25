@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests + Yul/Huff parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install huffc
+        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+
+      - name: Install deps
+        run: npm install
+
+      - name: Compile (Solidity + Yul)
+        run: npx hardhat compile
+
+      - name: Compile MEV_V2.huff
+        run: |
+          mkdir -p artifacts
+          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+
+      - name: Run unit tests (Yul + Huff variants)
+        run: npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js
+
+  fork:
+    name: Mainnet fork tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install huffc
+        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+
+      - name: Install deps
+        run: npm install
+
+      - name: Compile
+        run: |
+          npx hardhat compile
+          mkdir -p artifacts
+          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+
+      - name: Run fork tests
+        env:
+          HARDHAT_FORK: '1'
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL || 'https://ethereum-rpc.publicnode.com' }}
+        run: npx hardhat test test/GreedySimulatorV2.fork.test.js test/MEV_V2_v4_nested.fork.test.js
+
+  gas-report:
+    name: Gas diff report
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install huffc
+        run: curl -L get.huff.sh | bash && echo "$HOME/.huff/bin" >> $GITHUB_PATH
+
+      - name: Baseline gas (base branch)
+        run: |
+          npm install
+          npx hardhat compile
+          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          REPORT_GAS=true GAS_REPORT_FILE=gas-base.txt npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js || true
+
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: PR gas
+        run: |
+          npm install
+          npx hardhat compile
+          huffc contracts/MEV_V2.huff --bytecode > artifacts/MEV_V2_huff.bin
+          REPORT_GAS=true GAS_REPORT_FILE=gas-pr.txt npx hardhat test test/MEV_V2.test.js test/RouteSimulatorV2.test.js || true
+
+      - name: Diff comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const base = fs.existsSync('gas-base.txt') ? fs.readFileSync('gas-base.txt', 'utf8') : '(no baseline)';
+            const pr   = fs.existsSync('gas-pr.txt')   ? fs.readFileSync('gas-pr.txt', 'utf8')   : '(no pr report)';
+            const body = `### Gas report\n\n<details><summary>Baseline (\`${context.payload.pull_request.base.ref}\`)</summary>\n\n\`\`\`\n${base}\n\`\`\`\n</details>\n\n<details open><summary>This PR</summary>\n\n\`\`\`\n${pr}\n\`\`\`\n</details>`;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

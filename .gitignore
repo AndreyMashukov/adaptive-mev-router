@@ -1,0 +1,17 @@
+node_modules/
+artifacts/
+cache/
+coverage/
+coverage.json
+typechain/
+typechain-types/
+
+.env
+.env.local
+*.log
+
+gas-report.txt
+
+.DS_Store
+.idea/
+.vscode/
